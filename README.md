@@ -51,7 +51,9 @@ It is designed to work with modern AI assistants that support MCP, providing the
   
 ## 📸 Dashboard
 
-![Dashboard](<img width="1358" height="622" alt="Screenshot 2026-06-27 174628" src="https://github.com/user-attachments/assets/212780dc-1d71-49ad-b6ee-65f74ccaa3e8" />)
+![Dashboard](<img width="1358" height="622" alt="Screenshot 2026-06-27 174628" src="https://github.com/user-attachments/assets/b7196778-7532-4887-a8fa-927c707c3a86" />
+)
+
 
 ## ✏ Safe Code Editing
 
