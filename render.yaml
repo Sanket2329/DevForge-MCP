@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: leadsense-mcp
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /status
+    envVars:
+      - key: PROJECT_PATH
+        value: /opt/render/project/src   # path to the repo Render checked out for you
+      - key: WORKSPACE_ROOT
+        value: /opt/render/project/src/..
+      - key: PORT
+        value: 10000
+      - key: MCP_API_KEY
+        sync: false   # set this in the Render dashboard if you want the dashboard API protected

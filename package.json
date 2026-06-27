@@ -1,0 +1,21 @@
+{
+  "name": "leadsense-mcp-enhanced",
+  "version": "13.0.0",
+  "description": "Generic AI Development MCP server — multi-project, multi-language codebase intelligence for ChatGPT/Claude",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --experimental-vm-modules node_modules/jest-cli/bin/jest.js --testPathPattern=tests/"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.0",
+    "chokidar": "^3.6.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "fast-check": "^3.23.2",
+    "jest": "^29.7.0",
+    "supertest": "^7.2.2"
+  }
+}

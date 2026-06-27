@@ -1,0 +1,6 @@
+node_modules
+.git
+.mcp-cache
+.mcp-memory
+npm-debug.log
+*.log
