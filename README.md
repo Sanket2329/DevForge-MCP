@@ -51,7 +51,7 @@ It is designed to work with modern AI assistants that support MCP, providing the
   
 ## 📸 Dashboard
 
-![Dashboard](https://github.com/Sanket2329/DevForge-MCP/blob/main/dashboard.png)
+![Dashboard]()
 
 
 ## ✏ Safe Code Editing
