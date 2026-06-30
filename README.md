@@ -1,6 +1,10 @@
 # 🚀 DevForge-MCP
 
 <p align="center">
+  <img src="./devforge%20logo.png" alt="DevForge-MCP" width="900">
+</p>
+
+<p align="center">
   <strong>A Production-Ready Model Context Protocol (MCP) Server for AI-Assisted Software Development</strong>
 </p>
 
