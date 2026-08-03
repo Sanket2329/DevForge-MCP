@@ -39,7 +39,9 @@ const mockDeps = {
   // lib stubs — return minimal safe values
   indexer: {},
   architecture: {},
-  fsTools: {},
+  fsTools: {
+    readFileSafe: () => ({ success: false, error: "stub" }),
+  },
   codeIntel: {
     findSymbol: () => [],
     findClass: () => [],
@@ -59,16 +61,25 @@ const mockDeps = {
   listProjects: () => [],
   selectProject: () => ({}),
   getCurrentProject: () => ({}),
+  // Per-project variants required by handlers.js dispatch (Bug 6 fix)
+  getCurrentProjectFor: () => ({}),
+  refreshIndexFor: () => {},
   refreshIndex: () => {},
   semanticSearch: () => [],
   buildDependencyGraph: () => ({}),
   writeFileContent: () => ({}),
+  writeFileContentFor: () => ({}),
   writeMultipleFiles: () => [],
+  writeMultipleFilesFor: () => [],
   addToHistory: () => {},
+  addToHistoryFor: () => {},
   getHistorySummary: () => "",
+  getHistorySummaryFor: () => "",
   addProjectNote: () => ({}),
+  addProjectNoteFor: () => ({}),
   getProjectMemory: () => ({}),
-  mergeIndexOnSuccess: (r) => r,
+  getProjectMemoryFor: () => ({}),
+  mergeIndexOnSuccess: (r, _project, _path) => r,
 };
 
 /**
