@@ -62,7 +62,7 @@ describe("POST /mcp", () => {
   // application/json and text/event-stream (MCP spec §4.2).
   const MCP_ACCEPT = "application/json, text/event-stream";
 
-  test("tools/list returns 200 with a tools array of length 44", async () => {
+  test("tools/list returns 200 with a non-empty tools array", async () => {
     const res = await request(app)
       .post("/mcp")
       .set("Content-Type", "application/json")
@@ -76,7 +76,9 @@ describe("POST /mcp", () => {
     expect(body).toHaveProperty("result");
     expect(body.result).toHaveProperty("tools");
     expect(Array.isArray(body.result.tools)).toBe(true);
-    expect(body.result.tools).toHaveLength(44);
+    // Assert a minimum count rather than an exact magic number so adding new
+    // tools does not silently break CI (Bug 14 fix).
+    expect(body.result.tools.length).toBeGreaterThanOrEqual(44);
   });
 
   test("non-JSON body (invalid JSON) returns 400", async () => {

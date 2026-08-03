@@ -49,7 +49,7 @@ function refreshIndex() {
   st.latestContext.indexSize = Object.keys(st.codebaseIndex).length;
   st.latestContext.lastScan = new Date().toISOString();
   st.latestContext.status = "Ready";
-  st.architectureInfo = architecture.detectArchitecture(st.codebaseIndex);
+  st.architectureInfo = architecture.detectArchitecture(st.codebaseIndex, { projectPath: PROJECT, fsTools });
   st.latestContext.architecture = st.architectureInfo;
 
   cache.saveIndexCache(WORKSPACE_ROOT, PROJECT, { codebaseIndex: st.codebaseIndex, architectureInfo: st.architectureInfo });
@@ -265,21 +265,136 @@ function attachWatcher(projectPath) {
 
 // ── Graceful persistence on shutdown (Phase 12) ──────────────────────────────
 
-function persistAllProjects() {
+async function persistAllProjects() {
+  const saves = [];
   for (const projectPath of state.listLoadedProjects()) {
     const st = state.getState(projectPath);
-    cache.saveIndexCache(WORKSPACE_ROOT, projectPath, { codebaseIndex: st.codebaseIndex, architectureInfo: st.architectureInfo });
-    cache.saveMemory(WORKSPACE_ROOT, projectPath, { projectMemory: st.projectMemory, conversationHistory: st.conversationHistory });
+    saves.push(cache.saveIndexCache(WORKSPACE_ROOT, projectPath, { codebaseIndex: st.codebaseIndex, architectureInfo: st.architectureInfo }));
+    saves.push(cache.saveMemory(WORKSPACE_ROOT, projectPath, { projectMemory: st.projectMemory, conversationHistory: st.conversationHistory }));
   }
+  await Promise.allSettled(saves);
 }
-process.on("SIGINT", () => { persistAllProjects(); process.exit(0); });
-process.on("SIGTERM", () => { persistAllProjects(); process.exit(0); });
+process.on("SIGINT", () => { persistAllProjects().finally(() => process.exit(0)); });
+process.on("SIGTERM", () => { persistAllProjects().finally(() => process.exit(0)); });
 
-function mergeIndexOnSuccess(result, relPath) {
+function mergeIndexOnSuccess(result, projectPath, relPath) {
   if (result.success && result.indexEntry) {
-    state.getState(PROJECT).codebaseIndex[relPath] = result.indexEntry;
+    state.getState(projectPath).codebaseIndex[relPath] = result.indexEntry;
   }
   return result;
+}
+
+// ── Per-project helpers for request-scoped dispatch (Bug 6 fix) ──────────────
+// These accept an explicit projectPath so the MCP handlers never touch the
+// module-level PROJECT global during normal tool dispatch.
+
+function getCurrentProjectFor(projectPath) {
+  const st = state.getState(projectPath);
+  return {
+    name: path.basename(projectPath),
+    path: projectPath,
+    indexSize: st.latestContext.indexSize,
+    architecture: st.architectureInfo?.primary || null,
+    lastScan: st.latestContext.lastScan,
+  };
+}
+
+function refreshIndexFor(projectPath) {
+  const st = state.getState(projectPath);
+  const previous = Object.keys(st.codebaseIndex).length
+    ? st.codebaseIndex
+    : (cache.loadIndexCache(WORKSPACE_ROOT, projectPath)?.codebaseIndex || {});
+  st.codebaseIndex = indexer.buildCodebaseIndex(projectPath, previous);
+  st.latestContext.indexSize = Object.keys(st.codebaseIndex).length;
+  st.latestContext.lastScan = new Date().toISOString();
+  st.latestContext.status = "Ready";
+  st.architectureInfo = architecture.detectArchitecture(st.codebaseIndex, { projectPath, fsTools });
+  st.latestContext.architecture = st.architectureInfo;
+  cache.saveIndexCache(WORKSPACE_ROOT, projectPath, { codebaseIndex: st.codebaseIndex, architectureInfo: st.architectureInfo });
+}
+
+function semanticSearchFor(query, maxResults = 10, projectPath) {
+  const st = state.getState(projectPath);
+  const terms = (query || "").toLowerCase().split(/\s+/).filter(Boolean);
+  const scored = [];
+  for (const [relPath, file] of Object.entries(st.codebaseIndex)) {
+    const haystack = (relPath + " " + file.content).toLowerCase();
+    let score = 0;
+    for (const term of terms) {
+      const matches = (haystack.match(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length;
+      score += matches;
+      if (relPath.toLowerCase().includes(term)) score += 10;
+    }
+    if (score > 0) scored.push({ path: relPath, score, preview: file.content.slice(0, 300) });
+  }
+  st.recentSearches.push(query);
+  if (st.recentSearches.length > 30) st.recentSearches.shift();
+  return scored.sort((a, b) => b.score - a.score).slice(0, maxResults);
+}
+
+function buildDependencyGraphFor(projectPath) {
+  const st = state.getState(projectPath);
+  const graph = {};
+  for (const [relPath, file] of Object.entries(st.codebaseIndex)) {
+    if (file.ext === ".cs") {
+      const imports = [...file.content.matchAll(/^using\s+([\w.]+);/gm)].map((m) => m[1]);
+      const ns = (file.content.match(/^namespace\s+([\w.]+)/m) || [])[1] || "unknown";
+      graph[relPath] = { namespace: ns, imports };
+    } else if ([".js", ".jsx", ".ts", ".tsx"].includes(file.ext)) {
+      const imports = [...file.content.matchAll(/(?:import[^'"]*from\s+|require\()\s*['"]([^'"]+)['"]\)?/g)].map((m) => m[1]);
+      graph[relPath] = { imports };
+    } else if (file.ext === ".py") {
+      const imports = [...file.content.matchAll(/^(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))/gm)].map((m) => m[1] || m[2]);
+      graph[relPath] = { imports };
+    } else if (file.ext === ".go") {
+      const block = file.content.match(/import\s*\(([^)]*)\)/);
+      const imports = block ? block[1].split("\n").map((l) => l.trim().replace(/"/g, "")).filter(Boolean) : [];
+      graph[relPath] = { imports };
+    }
+  }
+  return graph;
+}
+
+function writeFileContentFor(projectPath, relativePath, content) {
+  const st = state.getState(projectPath);
+  const result = fsTools.writeFileContent(projectPath, relativePath, content);
+  if (result.success) {
+    st.codebaseIndex[relativePath] = result.indexEntry;
+    logger.info("Written:", relativePath);
+    return { success: true };
+  }
+  logger.error("Write error:", result.error);
+  return result;
+}
+
+function writeMultipleFilesFor(projectPath, files) {
+  return files.map(({ path: relPath, content }) => ({ path: relPath, ...writeFileContentFor(projectPath, relPath, content) }));
+}
+
+function addToHistoryFor(projectPath, role, content) {
+  const st = state.getState(projectPath);
+  st.conversationHistory.push({ role, content, timestamp: new Date().toISOString() });
+  if (st.conversationHistory.length > 40) st.conversationHistory.shift();
+}
+
+function getHistorySummaryFor(projectPath) {
+  const st = state.getState(projectPath);
+  return st.conversationHistory.slice(-10)
+    .map((h) => `[${h.role.toUpperCase()} @ ${h.timestamp}]: ${String(h.content).slice(0, 200)}`)
+    .join("\n");
+}
+
+function addProjectNoteFor(projectPath, type, content) {
+  if (!MEMORY_TYPES.includes(type)) return { success: false, error: `type must be one of: ${MEMORY_TYPES.join(", ")}` };
+  if (!content) return { success: false, error: "content is required" };
+  const st = state.getState(projectPath);
+  st.projectMemory[type].push({ content, timestamp: new Date().toISOString() });
+  cache.saveMemory(WORKSPACE_ROOT, projectPath, { projectMemory: st.projectMemory, conversationHistory: st.conversationHistory });
+  return { success: true, projectMemory: st.projectMemory };
+}
+
+function getProjectMemoryFor(projectPath) {
+  return state.getState(projectPath).projectMemory;
 }
 
 // ── Dependency bundle for mcp/ modules ───────────────────────────────────────
@@ -302,8 +417,6 @@ const deps = {
   selectProject,
   getCurrentProject,
   refreshIndex,
-  semanticSearch,
-  buildDependencyGraph,
   writeFileContent,
   writeMultipleFiles,
   addToHistory,
@@ -312,12 +425,30 @@ const deps = {
   getProjectMemory,
   mergeIndexOnSuccess,
   MEMORY_TYPES,
+  // Per-project (request-scoped) variants — used by mcp/handlers.js dispatch
+  // so concurrent requests never share or overwrite each other's PROJECT state.
+  // These replace the original module-level functions for all MCP tool calls.
+  semanticSearch: semanticSearchFor,
+  buildDependencyGraph: buildDependencyGraphFor,
+  getCurrentProjectFor,
+  refreshIndexFor,
+  writeFileContentFor,
+  writeMultipleFilesFor,
+  addToHistoryFor,
+  getHistorySummaryFor,
+  addProjectNoteFor,
+  getProjectMemoryFor,
 };
 
 // ── Express App ───────────────────────────────────────────────────────────────
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: "*",
+  allowedHeaders: ["Content-Type", "Authorization", "x-api-key", "ngrok-skip-browser-warning"],
+}));
+// ngrok free tier shows an interstitial for browser requests; this header bypasses it for API calls
+app.use((req, res, next) => { res.setHeader("ngrok-skip-browser-warning", "true"); next(); });
 app.use(express.json({ limit: "2mb" }));
 app.use("/public", express.static(path.join(__dirname, "public")));
 

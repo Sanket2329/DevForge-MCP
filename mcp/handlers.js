@@ -5,6 +5,34 @@ function ok(value) { return { content: [{ type: "text", text: JSON.stringify(val
 function text(value) { return { content: [{ type: "text", text: String(value) }] }; }
 
 /**
+ * resolveProject — returns the project path for this request.
+ *
+ * Priority order:
+ *   1. args.project (explicit per-call override — enables true per-request isolation
+ *      on the stateless HTTP transport without mutating any shared global)
+ *   2. deps.getProject() — the process-level default / last selectProject() call
+ *
+ * This is the core fix for the global PROJECT isolation bug: callers can pass
+ * `project` to any tool and every operation in that request is scoped to that
+ * path.  Concurrent requests that omit `project` still share the module-level
+ * default, which is intentional for single-user / single-project deployments.
+ *
+ * @param {object} deps
+ * @param {object|null} args
+ * @returns {string} resolved absolute project path
+ */
+function resolveProject(deps, args) {
+  if (args?.project) {
+    const path = require("path");
+    const candidate = path.isAbsolute(args.project)
+      ? args.project
+      : path.join(deps.WORKSPACE_ROOT, args.project);
+    return candidate;
+  }
+  return deps.getProject();
+}
+
+/**
  * dispatch — routes a tool call to its implementation.
  *
  * @param {string} name  — tool name from CallToolRequestSchema
@@ -19,14 +47,21 @@ function text(value) { return { content: [{ type: "text", text: String(value) }]
  */
 async function dispatch(name, args, deps) {
   try {
-    // Convenience accessor — mirrors `const st = () => state.getState(PROJECT);`
-    const st = () => deps.state.getState(deps.getProject());
+    // Per-request project resolution — does NOT mutate the module-level default.
+    // This is the fix for Bug 6: concurrent requests can no longer cross-contaminate
+    // each other's active project.
+    const project = resolveProject(deps, args);
+
+    // Convenience accessor scoped to this request's project
+    const st = () => deps.state.getState(project);
 
     // ── Phase 1 ──────────────────────────────────────────────────────────
     if (name === "list_projects") return ok(deps.listProjects());
+    // select_project mutates the process-level default intentionally — it is
+    // the explicit "switch active project" operation.
     if (name === "select_project") return ok(deps.selectProject(args?.project));
-    if (name === "get_current_project") return ok(deps.getCurrentProject());
-    if (name === "refresh_index") { deps.refreshIndex(); return ok(deps.getCurrentProject()); }
+    if (name === "get_current_project") return ok(deps.getCurrentProjectFor(project));
+    if (name === "refresh_index") { deps.refreshIndexFor(project); return ok(deps.getCurrentProjectFor(project)); }
 
     // ── Baseline ─────────────────────────────────────────────────────────
     if (name === "get_project_files") {
@@ -37,73 +72,100 @@ async function dispatch(name, args, deps) {
       return ok(files);
     }
     if (name === "get_file_content") {
-      const file = st().codebaseIndex[args?.path];
-      return text(file ? file.content : "File not found in index");
+      // Bug 5 fix: read directly from disk so callers always get the full file,
+      // bypassing the 25 KB index cache.
+      const read = deps.fsTools.readFileSafe(project, args?.path);
+      if (!read.success) return text("File not found or unreadable: " + (read.error || args?.path));
+      return ok({
+        path: args.path,
+        content: read.content,
+        truncated: false, // full disk read — never truncated here
+        sizeBytes: Buffer.byteLength(read.content),
+      });
     }
     if (name === "get_full_codebase") {
+      // Bug 5 fix: read every file fresh from disk so nothing is silently clipped.
+      // Include a per-file truncated flag when a file exceeds 25 KB so the caller
+      // knows which entries may be partial.
       const ext = args?.ext_filter?.toLowerCase();
       const idx = st().codebaseIndex;
-      const dump = Object.entries(idx)
-        .filter(([p]) => !ext || p.endsWith(ext))
-        .map(([p, f]) => `\n${"=".repeat(80)}\nFILE: ${p}\n${"=".repeat(80)}\n${f.content}`)
-        .join("\n");
+      const parts = [];
+      let truncatedFiles = 0;
+      for (const [p, f] of Object.entries(idx)) {
+        if (ext && !p.endsWith(ext)) continue;
+        const read = deps.fsTools.readFileSafe(project, p);
+        const content = read.success ? read.content : f.content; // fall back to cached slice on error
+        const wasTruncated = read.success && content.length !== f.content.length && f.content.length >= 25000;
+        if (wasTruncated) truncatedFiles++;
+        parts.push(`\n${"=".repeat(80)}\nFILE: ${p}${wasTruncated ? " [NOTE: previously truncated in cache; full content shown]" : ""}\n${"=".repeat(80)}\n${content}`);
+      }
       const arch = st().architectureInfo;
       const archSummary = arch ? `\n\nARCHITECTURE:\n${arch.summary}\nPatterns: ${arch.patterns.join(", ")}\nTech Stack: ${arch.techStack.join(", ")}` : "";
-      return text(archSummary + "\n\n" + dump);
+      const header = truncatedFiles > 0 ? `[INFO: ${truncatedFiles} file(s) were previously truncated in the cache and are now shown in full]\n` : "";
+      return text(header + archSummary + "\n\n" + parts.join("\n"));
     }
     if (name === "get_architecture") return ok(st().architectureInfo);
-    if (name === "search_codebase") return ok(deps.semanticSearch(args?.query, args?.max_results || 10));
-    if (name === "get_dependency_graph") return ok(deps.buildDependencyGraph());
+    if (name === "search_codebase") return ok(deps.semanticSearch(args?.query, args?.max_results || 10, project));
+    if (name === "get_dependency_graph") return ok(deps.buildDependencyGraph(project));
     if (name === "get_context") return ok(st().latestContext);
-    if (name === "write_file") return ok(deps.writeFileContent(args?.path, args?.content));
-    if (name === "write_multiple_files") return ok(deps.writeMultipleFiles(args?.files || []));
+    if (name === "write_file") return ok(deps.writeFileContentFor(project, args?.path, args?.content));
+    if (name === "write_multiple_files") return ok(deps.writeMultipleFilesFor(project, args?.files || []));
     if (name === "trigger_build") {
-      const result = await deps.buildTools.runBuild(deps.getProject());
+      const result = await deps.buildTools.runBuild(project);
       st().latestContext.buildError = result.success ? null : (result.output || result.error);
       return ok(result);
     }
-    if (name === "add_conversation_turn") { deps.addToHistory(args?.role, args?.content); return text("Stored."); }
-    if (name === "get_conversation_history") return text(deps.getHistorySummary());
+    if (name === "add_conversation_turn") { deps.addToHistoryFor(project, args?.role, args?.content); return text("Stored."); }
+    if (name === "get_conversation_history") return text(deps.getHistorySummaryFor(project));
 
     // ── Phase 4: Code intelligence ───────────────────────────────────────
-    if (name === "find_symbol") return ok(deps.codeIntel.findSymbol(st().codebaseIndex, args?.name, { ext_filter: args?.ext_filter }));
-    if (name === "find_class") return ok(deps.codeIntel.findClass(st().codebaseIndex, args?.name));
-    if (name === "find_method") return ok(deps.codeIntel.findMethod(st().codebaseIndex, args?.name));
-    if (name === "find_interface") return ok(deps.codeIntel.findInterface(st().codebaseIndex, args?.name));
-    if (name === "find_references") return ok(deps.codeIntel.findReferences(st().codebaseIndex, args?.symbol));
+    // Pass projectPath + fsTools so searchIndex reads fresh from disk (Bug 8 fix).
+    const intelOpts = { projectPath: project, fsTools: deps.fsTools };
+    if (name === "find_symbol") return ok(deps.codeIntel.findSymbol(st().codebaseIndex, args?.name, { ext_filter: args?.ext_filter, ...intelOpts }));
+    if (name === "find_class") return ok(deps.codeIntel.findClass(st().codebaseIndex, args?.name, intelOpts));
+    if (name === "find_method") return ok(deps.codeIntel.findMethod(st().codebaseIndex, args?.name, intelOpts));
+    if (name === "find_interface") return ok(deps.codeIntel.findInterface(st().codebaseIndex, args?.name, intelOpts));
+    if (name === "find_references") return ok(deps.codeIntel.findReferences(st().codebaseIndex, args?.symbol, intelOpts));
     if (name === "find_unused_files") return ok(deps.codeIntel.findUnusedFiles(st().codebaseIndex));
     if (name === "find_duplicate_code") return ok(deps.codeIntel.findDuplicateCode(st().codebaseIndex));
 
     // ── Phase 5: Safe editing ────────────────────────────────────────────
-    if (name === "patch_file") return ok(deps.mergeIndexOnSuccess(deps.editing.patchFile(deps.getProject(), args?.path, args?.old_text, args?.new_text), args?.path));
-    if (name === "replace_method") return ok(deps.mergeIndexOnSuccess(deps.editing.replaceMethod(deps.getProject(), args?.path, args?.method_name, args?.new_code), args?.path));
-    if (name === "delete_method") return ok(deps.mergeIndexOnSuccess(deps.editing.deleteMethod(deps.getProject(), args?.path, args?.method_name), args?.path));
-    if (name === "insert_method") return ok(deps.mergeIndexOnSuccess(deps.editing.insertMethod(deps.getProject(), args?.path, args?.class_name, args?.method_code, args?.position || "end"), args?.path));
-    if (name === "insert_class") return ok(deps.mergeIndexOnSuccess(deps.editing.insertClass(deps.getProject(), args?.path, args?.class_code), args?.path));
+    if (name === "patch_file") return ok(deps.mergeIndexOnSuccess(deps.editing.patchFile(project, args?.path, args?.old_text, args?.new_text), project, args?.path));
+    if (name === "replace_method") return ok(deps.mergeIndexOnSuccess(deps.editing.replaceMethod(project, args?.path, args?.method_name, args?.new_code), project, args?.path));
+    if (name === "delete_method") return ok(deps.mergeIndexOnSuccess(deps.editing.deleteMethod(project, args?.path, args?.method_name), project, args?.path));
+    if (name === "insert_method") return ok(deps.mergeIndexOnSuccess(deps.editing.insertMethod(project, args?.path, args?.class_name, args?.method_code, args?.position || "end"), project, args?.path));
+    if (name === "insert_class") return ok(deps.mergeIndexOnSuccess(deps.editing.insertClass(project, args?.path, args?.class_code), project, args?.path));
     if (name === "rename_symbol") {
-      const result = deps.editing.renameSymbol(deps.getProject(), st().codebaseIndex, args?.old_name, args?.new_name, { ext_filter: args?.ext_filter });
+      const result = deps.editing.renameSymbol(project, st().codebaseIndex, args?.old_name, args?.new_name, {
+        ext_filter: args?.ext_filter,
+        scope: args?.scope || "project",
+        relPath: args?.rel_path,
+      });
+      if (!result.success) return ok(result);
       result.changedFiles.forEach((f) => { st().codebaseIndex[f.path] = f.indexEntry; });
       return ok({ success: true, filesChanged: result.filesChanged, totalOccurrences: result.totalOccurrences, files: result.changedFiles.map((f) => ({ path: f.path, occurrences: f.occurrences })) });
     }
 
     // ── Phase 6: Git ─────────────────────────────────────────────────────
-    if (name === "git_status") return ok(await deps.gitTools.gitStatus(deps.getProject()));
-    if (name === "git_diff") return ok(await deps.gitTools.gitDiff(deps.getProject(), args?.file));
-    if (name === "git_log") return ok(await deps.gitTools.gitLog(deps.getProject(), args?.limit));
-    if (name === "show_untracked_files") return ok(await deps.gitTools.showUntrackedFiles(deps.getProject()));
-    if (name === "git_checkout") return ok(await deps.gitTools.gitCheckout(deps.getProject(), args?.branch));
-    if (name === "create_branch") return ok(await deps.gitTools.createBranch(deps.getProject(), args?.branch));
-    if (name === "commit_changes") return ok(await deps.gitTools.commitChanges(deps.getProject(), args?.message, args?.add_all !== false));
+    if (name === "git_status") return ok(await deps.gitTools.gitStatus(project));
+    if (name === "git_diff") return ok(await deps.gitTools.gitDiff(project, args?.file));
+    if (name === "git_log") return ok(await deps.gitTools.gitLog(project, args?.limit));
+    if (name === "show_untracked_files") return ok(await deps.gitTools.showUntrackedFiles(project));
+    if (name === "git_checkout") return ok(await deps.gitTools.gitCheckout(project, args?.branch));
+    if (name === "create_branch") return ok(await deps.gitTools.createBranch(project, args?.branch));
+    if (name === "commit_changes") return ok(await deps.gitTools.commitChanges(project, args?.message, args?.add_all !== false));
 
     // ── Phase 8: Project memory ──────────────────────────────────────────
-    if (name === "add_project_note") return ok(deps.addProjectNote(args?.type, args?.content));
-    if (name === "get_project_memory") return ok(deps.getProjectMemory());
+    if (name === "add_project_note") return ok(deps.addProjectNoteFor(project, args?.type, args?.content));
+    if (name === "get_project_memory") return ok(deps.getProjectMemoryFor(project));
 
     // ── Phase 9: Code review ─────────────────────────────────────────────
     if (name === "review_file") {
-      const file = st().codebaseIndex[args?.path];
-      if (!file) return text("File not found in index");
-      return ok(deps.reviewTools.reviewFile(args.path, file.content, file.ext));
+      // Bug 5 fix: read from disk, not the 25KB-capped cache entry.
+      const read = deps.fsTools.readFileSafe(project, args?.path);
+      if (!read.success) return text("File not found in index");
+      const ext = require("path").extname(args.path).toLowerCase();
+      return ok(deps.reviewTools.reviewFile(args.path, read.content, ext));
     }
     if (name === "review_project") return ok(deps.reviewTools.reviewProject(st().codebaseIndex));
     if (name === "find_code_smells") return ok(deps.reviewTools.findCodeSmells(st().codebaseIndex));
