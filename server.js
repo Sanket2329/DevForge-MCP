@@ -506,12 +506,14 @@ app.post("/api/select-project", security.apiKeyMiddleware, (req, res) => res.jso
 // send a custom header/API key here. See DEPLOYMENT.md.) ─────────────────────
 
 const mcpRateLimit = security.rateLimiter({ windowMs: 60000, max: 300 });
+// Hoist the handler so it isn't re-created on every request.
+const mcpHandler = mcpAvailable ? createMcpRouteHandler(deps) : null;
 
 app.post("/mcp", mcpRateLimit, (req, res) => {
-  if (!mcpAvailable) {
+  if (!mcpHandler) {
     return res.status(503).json({ error: "MCP unavailable" });
   }
-  return createMcpRouteHandler(deps)(req, res);
+  return mcpHandler(req, res);
 });
 
 // Phase 12: catch anything unhandled instead of crashing the process

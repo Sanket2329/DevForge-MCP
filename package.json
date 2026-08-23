@@ -1,6 +1,6 @@
 {
   "name": "leadsense-mcp-enhanced",
-  "version": "13.0.0",
+  "version": "13.1.0",
   "description": "Generic AI Development MCP server — multi-project, multi-language codebase intelligence for ChatGPT/Claude",
   "main": "server.js",
   "scripts": {
