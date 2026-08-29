@@ -63,6 +63,40 @@ test("export default function — no duplicate modifier", () => {
   assert(count === 1, `expected 1 'export default', got ${count}\n${after}`);
 });
 
+test("export default function with TS return-type annotation (ky real case)", () => {
+  const { dir, rel } = makeProject("ky.ts", [
+    "export default function isRawNetworkError(error: unknown): error is TypeError {",
+    "  return error instanceof TypeError && error.message === 'Failed to fetch';",
+    "}",
+  ].join("\n"));
+  const r = replaceMethod(dir, rel,
+    "isRawNetworkError",
+    "export default function isRawNetworkError(error: unknown): error is TypeError {\n  return error instanceof TypeError;\n}"
+  );
+  const after = read(dir, rel); cleanup(dir);
+  assert(r.success, "replaceMethod failed: " + r.error);
+  const count = (after.match(/export default/g) || []).length;
+  assert(count === 1, `expected 1 'export default', got ${count}\n${after}`);
+  assert(after.includes("error instanceof TypeError;"), "replacement not applied\n" + after);
+});
+
+test("async TS function with return type", () => {
+  const { dir, rel } = makeProject("fetch.ts", [
+    "export async function fetchUser(id: string): Promise<User> {",
+    "  return api.get(id);",
+    "}",
+  ].join("\n"));
+  const r = replaceMethod(dir, rel,
+    "fetchUser",
+    "export async function fetchUser(id: string): Promise<User> {\n  return api.getById(id);\n}"
+  );
+  const after = read(dir, rel); cleanup(dir);
+  assert(r.success, "replaceMethod failed: " + r.error);
+  assert(after.includes("getById"), "replacement not applied\n" + after);
+  const count = (after.match(/export async function fetchUser/g) || []).length;
+  assert(count === 1, `expected 1 declaration, got ${count}\n${after}`);
+});
+
 test("export function — no duplicate export", () => {
   const { dir, rel } = makeProject("b.js", [
     "export function helper(x) {",
