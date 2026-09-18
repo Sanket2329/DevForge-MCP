@@ -32,7 +32,7 @@ function sanitizeArgs(args) {
  */
 function createMcpServer(deps) {
   const server = new Server(
-    { name: "LeadSense MCP Enhanced", version: "13.1.0" },
+    { name: "LeadSense MCP Enhanced", version: "13.2.0" },
     { capabilities: { tools: {} } }
   );
 
